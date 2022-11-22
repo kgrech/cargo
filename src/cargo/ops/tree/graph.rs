@@ -1,6 +1,5 @@
 //! Code for building the graph used by `cargo tree`.
 
-use super::TreeOptions;
 use crate::core::compiler::{CompileKind, RustcTargetData};
 use crate::core::dependency::DepKind;
 use crate::core::resolver::features::{CliFeatures, FeaturesFor, ResolvedFeatures};
@@ -9,6 +8,13 @@ use crate::core::{FeatureMap, FeatureValue, Package, PackageId, PackageIdSpec, W
 use crate::util::interning::InternedString;
 use crate::util::CargoResult;
 use std::collections::{HashMap, HashSet};
+use crate::ops::tree::Target;
+
+pub struct GraphOptions {
+    pub target: Target,
+    pub graph_features: bool,
+    pub edge_kinds: HashSet<EdgeKind>,
+}
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum Node {
@@ -276,13 +282,14 @@ pub fn build<'a>(
     target_data: &RustcTargetData<'_>,
     requested_kinds: &[CompileKind],
     package_map: HashMap<PackageId, &'a Package>,
-    opts: &TreeOptions,
+    opts: &GraphOptions,
 ) -> CargoResult<Graph<'a>> {
     let mut graph = Graph::new(package_map);
     let mut members_with_features = ws.members_with_features(specs, cli_features)?;
     members_with_features.sort_unstable_by_key(|e| e.0.package_id());
     for (member, cli_features) in members_with_features {
         let member_id = member.package_id();
+        println!("Adding package {} to the graph", member_id);
         let features_for = FeaturesFor::from_for_host(member.proc_macro());
         for kind in requested_kinds {
             let member_index = add_pkg(
@@ -304,6 +311,7 @@ pub fn build<'a>(
     if opts.graph_features {
         add_internal_features(&mut graph, resolve);
     }
+    println!("Built graph of {} nodes", graph.nodes.len());
     Ok(graph)
 }
 
@@ -320,7 +328,7 @@ fn add_pkg(
     features_for: FeaturesFor,
     target_data: &RustcTargetData<'_>,
     requested_kind: CompileKind,
-    opts: &TreeOptions,
+    opts: &GraphOptions,
 ) -> usize {
     let node_features = resolved_features.activated_features(package_id, features_for);
     let node_kind = match features_for {
@@ -356,6 +364,7 @@ fn add_pkg(
                 };
                 // Filter out inactivated targets.
                 if !show_all_targets && !target_data.dep_platform_activated(dep, kind) {
+                    println!("Disabling {}", dep.package_name());
                     return false;
                 }
                 // Filter out dev-dependencies if requested.

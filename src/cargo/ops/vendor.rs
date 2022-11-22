@@ -1,6 +1,12 @@
+use crate::core::compiler::{CompileKind, RustcTargetData};
+use crate::core::dependency::DepKind;
+use crate::core::resolver::{CliFeatures, ForceAllTargets, HasDevUnits};
 use crate::core::shell::Verbosity;
-use crate::core::{GitReference, Workspace};
+use crate::core::{GitReference, Package, PackageId, PackageSet, Resolve, Workspace};
 use crate::ops;
+use crate::ops::tree::graph::{Graph, GraphOptions};
+use crate::ops::tree::{EdgeKind, Node, Target};
+use crate::ops::Packages;
 use crate::sources::path::PathSource;
 use crate::sources::CRATES_IO_REGISTRY;
 use crate::util::{CargoResult, Config};
@@ -15,10 +21,12 @@ use std::path::{Path, PathBuf};
 use toml_edit::easy as toml;
 
 pub struct VendorOptions<'a> {
+    pub cli_features: CliFeatures,
     pub no_delete: bool,
     pub versioned_dirs: bool,
     pub destination: &'a Path,
     pub extra: Vec<PathBuf>,
+    pub edge_kinds: HashSet<EdgeKind>,
 }
 
 pub fn vendor(ws: &Workspace<'_>, opts: &VendorOptions<'_>) -> CargoResult<()> {
@@ -145,30 +153,91 @@ fn sync(
     // Next up let's actually download all crates and start storing internal
     // tables about them.
     for ws in workspaces {
-        let (packages, resolve) =
-            ops::resolve_ws(ws).with_context(|| "failed to load pkg lockfile")?;
+        // TODO: Derive it from CLI flags like cargo tree does
+        let requested_targets = vec![
+            "x86_64-apple-darwin".to_string(),
+            "armv7-linux-androideabi".to_string(),
+            "i686-linux-android".to_string(),
+            "aarch64-linux-android".to_string(),
+            "x86_64-linux-android".to_string(),
+            "x86_64-linux-android".to_string(),
+            "x86_64-linux-android".to_string(),
+            "aarch64-apple-ios".to_string(),
+            "aarch64-apple-ios-sim".to_string(),
+            "x86_64-apple-ios".to_string(),
+        ];
+        let requested_kinds = CompileKind::from_requested_targets(ws.config(), &requested_targets)?;
+        let target_data = RustcTargetData::new(ws, &requested_kinds)?;
+        let specs = Packages::Default.to_package_id_specs(ws)?;
+        let has_dev = HasDevUnits::Yes;
+        let force_all = ForceAllTargets::No;
 
-        packages
-            .get_many(resolve.iter())
+        let graph_options = GraphOptions {
+            target: Target::Specific(requested_targets),
+            graph_features: false,
+            edge_kinds: opts.edge_kinds.clone(),
+        };
+
+        let ws_resolve = ops::resolve_ws_with_opts(
+            ws,
+            &target_data,
+            &requested_kinds,
+            &opts.cli_features,
+            &specs,
+            has_dev,
+            force_all,
+        )
+        .with_context(|| "failed to load pkg lockfile")?;
+        println!(
+            "Resolved returned {}/{} packages with {} targets",
+            ws_resolve.pkg_set.packages().count(),
+            ws_resolve.pkg_set.package_ids().count(),
+            ws_resolve.targeted_resolve.iter().count()
+        );
+
+        let package_map: HashMap<PackageId, &Package> = ws_resolve
+            .pkg_set
+            .packages()
+            .map(|pkg| (pkg.package_id(), pkg))
+            .collect();
+
+        println!("Collected the package map of size {}", package_map.len());
+
+        // TODO: Should not depend on tree here
+        let mut graph = ops::tree::graph::build(
+            ws,
+            &ws_resolve.targeted_resolve,
+            &ws_resolve.resolved_features,
+            &specs,
+            &opts.cli_features,
+            &target_data,
+            &requested_kinds,
+            package_map,
+            &graph_options,
+        )?;
+        let root_ids = ws_resolve.targeted_resolve.specs_to_ids(&specs)?;
+        let root_indexes = graph.indexes_from_ids(&root_ids);
+
+        ws_resolve
+            .pkg_set
+            .get_many(ws_resolve.targeted_resolve.iter())
             .with_context(|| "failed to download packages")?;
 
-        for pkg in resolve.iter() {
-            // No need to vendor path crates since they're already in the
-            // repository
-            if pkg.source_id().is_path() {
-                continue;
-            }
-            ids.insert(
-                pkg,
-                packages
-                    .get_one(pkg)
-                    .with_context(|| "failed to fetch package")?
-                    .clone(),
-            );
+        println!(
+            "Resolved package number of download is {}",
+            ws_resolve.pkg_set.packages().count()
+        );
 
-            checksums.insert(pkg, resolve.checksums().get(&pkg).cloned());
-        }
+        traverse_graph(
+            &mut ids,
+            &mut checksums,
+            &ws_resolve.pkg_set,
+            &ws_resolve.targeted_resolve,
+            root_indexes,
+            &graph,
+        );
     }
+    println!("Collected if map of size {}", ids.len());
 
     let mut versions = HashMap::new();
     for id in ids.keys() {
@@ -357,6 +426,115 @@ fn cp_sources(
         cksums.insert(relative.to_str().unwrap().replace("\\", "/"), cksum);
     }
     Ok(())
+}
+
+fn traverse_graph(
+    ids: &mut BTreeMap<PackageId, Package>,
+    checksums: &mut HashMap<PackageId, Option<Option<String>>>,
+    packages: &PackageSet,
+    resolve: &Resolve,
+    roots: Vec<usize>,
+    graph: &Graph<'_>,
+) {
+    let mut visited_deps = HashSet::new();
+    for root_index in roots.into_iter() {
+        visit_node(
+            ids,
+            checksums,
+            packages,
+            resolve,
+            root_index,
+            &mut visited_deps,
+            graph,
+        );
+    }
+}
+
+fn visit_node(
+    ids: &mut BTreeMap<PackageId, Package>,
+    checksums: &mut HashMap<PackageId, Option<Option<String>>>,
+    packages: &PackageSet,
+    resolve: &Resolve,
+    node_index: usize,
+    visited_deps: &mut HashSet<usize>,
+    graph: &Graph<'_>,
+) {
+    if !visited_deps.insert(node_index) {
+        return;
+    }
+    let node = graph.node(node_index);
+    let package_id = match node {
+        Node::Package { package_id, .. } => package_id,
+        Node::Feature { node_index, .. } => {
+            let for_node = graph.node(*node_index);
+            match for_node {
+                Node::Package { package_id, .. } => package_id,
+                // The node_index in Node::Feature must point to a package
+                // node, see `add_feature`.
+                _ => panic!("unexpected feature node {:?}", for_node),
+            }
+        }
+    }
+    .clone();
+    // No need to vendor path crates since they're already in the
+    // repository
+    if !package_id.source_id().is_path() {
+        ids.insert(
+            package_id.clone(),
+            packages
+                .get_one(package_id)
+                .expect("failed to fetch package")
+                .clone(),
+        );
+        checksums.insert(package_id, resolve.checksums().get(&package_id).cloned());
+    }
+
+    for kind in &[
+        EdgeKind::Dep(DepKind::Normal),
+        EdgeKind::Dep(DepKind::Build),
+        EdgeKind::Dep(DepKind::Development),
+        EdgeKind::Feature,
+    ] {
+        visit_dependencies(
+            ids,
+            checksums,
+            packages,
+            resolve,
+            node_index,
+            visited_deps,
+            graph,
+            kind,
+        );
+    }
+}
+
+fn visit_dependencies(
+    ids: &mut BTreeMap<PackageId, Package>,
+    checksums: &mut HashMap<PackageId, Option<Option<String>>>,
+    packages: &PackageSet,
+    resolve: &Resolve,
+    node_index: usize,
+    visited_deps: &mut HashSet<usize>,
+    graph: &Graph<'_>,
+    kind: &EdgeKind,
+) {
+    let deps = graph.connected_nodes(node_index, kind);
+    if deps.is_empty() {
+        return;
+    }
+    // TODO: Filter out packages to prune.
+    let mut it = deps.iter();
+    while let Some(node_index) = it.next() {
+        visit_node(
+            ids,
+            checksums,
+            packages,
+            resolve,
+            *node_index,
+            visited_deps,
+            graph,
+        );
+    }
 }
 
 fn copy_and_checksum(src_path: &Path, dst_path: &Path, buf: &mut [u8]) -> CargoResult<String> {

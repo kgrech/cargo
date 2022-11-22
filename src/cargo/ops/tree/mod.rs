@@ -14,9 +14,12 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 mod format;
-mod graph;
+// TODO: Move it one level up instead of making it public and have deps from vendor to tree
+// What is the bast package structure?
+pub mod graph;
 
 pub use {graph::EdgeKind, graph::Node};
+use crate::ops::tree::graph::GraphOptions;
 
 pub struct TreeOptions {
     pub cli_features: CliFeatures,
@@ -51,7 +54,7 @@ pub struct TreeOptions {
     pub no_proc_macro: bool,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone)]
 pub enum Target {
     Host,
     Specific(Vec<String>),
@@ -166,6 +169,12 @@ pub fn build_and_print(ws: &Workspace<'_>, opts: &TreeOptions) -> CargoResult<()
         .map(|pkg| (pkg.package_id(), pkg))
         .collect();
 
+    let graph_options = GraphOptions {
+        target: opts.target.clone(),
+        graph_features: opts.graph_features,
+        edge_kinds: opts.edge_kinds.clone(),
+    };
+
     let mut graph = graph::build(
         ws,
         &ws_resolve.targeted_resolve,
@@ -175,7 +184,7 @@ pub fn build_and_print(ws: &Workspace<'_>, opts: &TreeOptions) -> CargoResult<()
         &target_data,
         &requested_kinds,
         package_map,
-        opts,
+        &graph_options,
     )?;
 
     let root_specs = if opts.invert.is_empty() {
@@ -212,6 +221,9 @@ pub fn build_and_print(ws: &Workspace<'_>, opts: &TreeOptions) -> CargoResult<()
             r.and_then(|spec| spec.query(ws_resolve.targeted_resolve.iter()).and(Ok(spec)))
         })
         .collect::<CargoResult<Vec<PackageIdSpec>>>()?;
+
+    println!("pkgs_to_prune count = {}",
+             pkgs_to_prune.len());
 
     if root_indexes.len() == 0 {
         ws.config().shell().warn(

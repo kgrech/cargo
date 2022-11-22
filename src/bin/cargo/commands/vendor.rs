@@ -1,6 +1,7 @@
 use crate::command_prelude::*;
 use cargo::ops;
 use std::path::PathBuf;
+use crate::commands::tree::parse_edge_kinds;
 
 pub fn cli() -> Command {
     subcommand("vendor")
@@ -34,6 +35,18 @@ pub fn cli() -> Command {
             "versioned-dirs",
             "Always include version in subdir name",
         ))
+        // TODO add more flags supported by cargo-tree
+        .arg_features()
+        .arg(
+            multi_opt(
+                "edges",
+                "KINDS",
+                "The kinds of dependencies to display \
+                 (features, normal, build, dev, all, \
+                 no-normal, no-build, no-dev, no-proc-macro)",
+            )
+                .short('e'),
+        )
         .arg(flag("no-merge-sources", "Not supported").hide(true))
         .arg(flag("relative-path", "Not supported").hide(true))
         .arg(flag("only-git-deps", "Not supported").hide(true))
@@ -83,12 +96,17 @@ https://github.com/rust-lang/cargo/issues/new
         .get_one::<PathBuf>("path")
         .cloned()
         .unwrap_or_else(|| PathBuf::from("vendor"));
+
+    let (edge_kinds, _no_proc_macro) = parse_edge_kinds(config, args)?;
+
     ops::vendor(
         &ws,
         &ops::VendorOptions {
+            cli_features: args.cli_features()?,
             no_delete: args.flag("no-delete"),
             destination: &path,
             versioned_dirs: args.flag("versioned-dirs"),
+            edge_kinds,
             extra: args
                 .get_many::<PathBuf>("tomls")
                 .unwrap_or_default()

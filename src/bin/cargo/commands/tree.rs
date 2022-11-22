@@ -212,7 +212,8 @@ subtree of the package given to -p.\n\
 /// Parses `--edges` option.
 ///
 /// Returns a tuple of `EdgeKind` map and `no_proc_marco` flag.
-fn parse_edge_kinds(config: &Config, args: &ArgMatches) -> CargoResult<(HashSet<EdgeKind>, bool)> {
+//TODO: Move it out of tree or figure out defauilt value for vendor command
+pub fn parse_edge_kinds(config: &Config, args: &ArgMatches) -> CargoResult<(HashSet<EdgeKind>, bool)> {
     let (kinds, no_proc_macro) = {
         let mut no_proc_macro = false;
         let mut kinds = args.get_many::<String>("edges").map_or_else(
